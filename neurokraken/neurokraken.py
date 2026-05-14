@@ -10,9 +10,9 @@ from threading import Thread
 import time
 import importlib.util
 import inspect
-from py5 import Sketch
+Sketch = None
 # type hint imports
-from typing import Callable, Container
+from typing import Callable, Container, Any
 from core.state_machine import State
 
 class _SerialReady(Exception):
@@ -25,7 +25,13 @@ class Neurokraken:
                  subject:dict|str={'ID': '_'}, serial_key:str='KRAKEN',
                  autostart=True, max_framerate=8_000, networker_mode='archivist', agent=None,
                  config:Container={}, task_path:Path=None, import_pre_run:str=None,
-                 log_performance=False):
+                 log_performance=False,
+                 headless: bool=False,
+                 sim_speed: float=1.0,
+                 task_tick_hz: int=200,
+                 render_hz: int=0,
+                 action_hold_steps: int=1,
+                 ):
         """Create a Neurokraken instance using the provided device configuration.
         This class manages communication with hardware components including serial
         interfaces, camera systems, and data logging. It handles task execution,
@@ -53,7 +59,8 @@ class Neurokraken:
                                         log folder as a backup of the experiment run. This path will also be searched
                                         for a file launch.py to import and run before the experiment start.
             import_pre_run (str, optional): Useful in runner mode. 
-                                            Path to a .py file to import just before starting the run, i.e. to start a GUI
+                                            Path to a .py file to import just before starting the run, i.e. to start a GUI.
+            TODO: write the description for the new parameters headless, sim_speed, task_tick_hz, render_hz, action_hold_steps
         """
         self.running_config2teensy = False
         stack = inspect.stack()
@@ -70,6 +77,17 @@ class Neurokraken:
         self.task_path = task_path
         self.import_pre_run = import_pre_run
         self.log_performance = log_performance
+        
+        self.mode = mode
+        self.headless = headless
+        self.sim_speed = sim_speed
+        self.task_tick_hz = task_tick_hz
+        self.render_hz = render_hz
+        self.action_hold_steps = action_hold_steps
+        
+        if self.headless:
+            cameras = ()
+            microphones = ()
 
         #------------------------- CHECK CORE SERIAL ENTRIES -------------------------
         if not 't_ms' in self.serial_in.keys():
@@ -242,7 +260,7 @@ class Neurokraken:
                   experiment:Container={}, start_block:str|None=None, permanent_states:list[Callable]=(),
                   run_at_start:Callable=lambda : None, run_at_quit:Callable=lambda : None,
                   run_post_trial:Callable=lambda : None,
-                  run_at_visual_start:Callable[[Sketch], None]=lambda sketch : None,
+                  run_at_visual_start:Callable[[Any], None]=lambda sketch : None,
                   main_as_sketch:bool=True):
         
         from . import controls
@@ -274,46 +292,64 @@ class Neurokraken:
                                           max_framerate=self.max_framerate, permanent_states=permanent_states,
                                           threads_info=self.threads_info, 
                                           run_at_start=run_at_start, run_at_quit=run_at_quit, run_post_trial=run_post_trial,
-                                          log_performance=self.log_performance)
+                                          log_performance=self.log_performance, 
+                                          # new:
+                                          mode=self.mode, sim_speed = self.sim_speed, task_tick_hz=self.task_tick_hz, 
+                                          render_hz=self.render_hz, action_hold_steps=self.action_hold_steps,
+        )
         
         #------------------------- TASK DISPLAY -------------------------
 
-        if self.display_config is not None:
+        if self.display_config is not None and not self.headless:
             main_loops.visual = main_loops.Visual(self.machine, display_config=self.display_config, 
                                                   run_controls=self.run_controls, threads_info=self.threads_info,
                                                   run_at_visual_start=run_at_visual_start)
         #------------------------- LOAD ASSETS -------------------------
+        
+        if self.display_config is not None and not self.headless:
+            from py5 import Sketch as _Sketch
+            Sketch = _Sketch
+            class Pre_Task(Sketch):
+                """This sketch merely acts as a py5 instance to run py5 depending code, i.e. loading textures 
+                before the main- and display loops that may depend on this data being loaded."""
+                def __init__(self, blocks):
+                    super().__init__()
+                    self.blocks = blocks
 
-        class Pre_Task(Sketch):
-            """This sketch merely acts as a py5 instance to run py5 depending code, i.e. loading textures 
-            before the main- and display loops that may depend on this data being loaded."""
-            def __init__(self, blocks):
-                super().__init__()
-                self.blocks = blocks
+                def settings(self):
+                    self.size(120, 120, self.P3D)
 
-            def settings(self):
-                self.size(120, 120, self.P3D)
+                def setup(self):
+                    # P3D doesn't work with .get_surface().set_visible(False) so the window will flicker up for a short moment during this step
+                    # self.world = self.load_shape(r'C:\Users\q131aw\Desktop\temp\test3d\otherFolder\world.obj')
+                    for block in self.blocks.values():
+                        for state in block.values():
+                            state.pre_task(self)
 
-            def setup(self):
-                # P3D doesn't work with .get_surface().set_visible(False) so the window will flicker up for a short moment during this step
-                # self.world = self.load_shape(r'C:\Users\q131aw\Desktop\temp\test3d\otherFolder\world.obj')
-                for block in self.blocks.values():
-                    for state in block.values():
-                        state.pre_task(self)
-
-            def draw(self):
-                # setup and the included load_shape seems to behave slightly asynchronous
-                # - once the sketch ran for several frames assets should be loaded.
-                if self.frame_count == 5:
-                    self.exit_sketch()
-
-        pre_task = Pre_Task(self.machine.blocks)
-        pre_task.run_sketch(block=True)
+                def draw(self):
+                    # setup and the included load_shape seems to behave slightly asynchronous
+                    # - once the sketch ran for several frames assets should be loaded.
+                    if self.frame_count == 5:
+                        self.exit_sketch()
+            
+            pre_task = Pre_Task(self.machine.blocks)
+            pre_task.run_sketch(block=True)
+        
+        else:
+            # Headless: optionally call pre_task(None) without py5
+            for block in self.machine.blocks.values():
+                for state in block.values():
+                    # only call if state overrides pre_task and can handle None
+                    try:
+                        state.pre_task(None)
+                    except Exception:
+                        # state.pre_task expects a Sketch; in headless we skip assets
+                        pass
 
         #------------------------- GARBAGE COLLECTION -------------------------
 
         import platform
-        if platform.system() == 'Windows':
+        if platform.system() == 'Windows' and (self.mode != 'agent') and (not self.headless):
             import gc
 
             gc_level = 0
@@ -366,7 +402,7 @@ class Neurokraken:
         from core import main_loops
         #------------------------- VISUAL LOOP -------------------------
 
-        if self.display_config is not None:
+        if self.display_config is not None and not self.headless:
             main_loops.visual.run_sketch(block=False)
             # safety for the borderless window starting out at a higher size
             while not main_loops.visual.frame_count > 1:
@@ -399,3 +435,74 @@ class Neurokraken:
                 except PermissionError as e:
                     # some process (likely video saving) is still utilizing the temp dir preventing deletion - try again later
                     time.sleep(0.1)
+                    
+                    
+    # NEW: agent mode methods
+    def get_obs(self, keys: list[str] | None = None) -> dict:
+        """Observation for agents/RL. Gets the current serial_in values and task context."""
+        from . import controls
+        if keys is None:
+            keys = [k for k in self.serial_in.keys() if k != 't_ms']
+        obs_vec = [self.serial_in[k].get('value') for k in keys]
+        return {
+            'vector': obs_vec,
+            'keys': keys,
+            '_state': getattr(controls.get, 'current_state', None),
+            '_block': getattr(controls.get, 'current_block', None),
+            '_t_ms': self.serial_in['t_ms']['value'],
+        }
+    
+    def get_reward_dict(self, include_input: bool = False) -> dict:
+        """Get a dictionary of output values that would be considered a reward by the current task. Optionally include input values as well. This can be used as an interface to define a reward function for RL agents based on the task itself."""
+        from . import controls
+        reward_dict = {k: v.get('value') for k, v in self.serial_out.items()}
+        if include_input:
+            reward_dict.update({k: v.get('value') for k, v in self.serial_in.items()})
+        # add task context
+        reward_dict['_state'] = getattr(controls.get, 'current_state', None)
+        reward_dict['_block'] = getattr(controls.get, 'current_block', None)
+        return reward_dict
+
+    def reset(self, clear_log: bool = True, reset_io: bool = True):
+        """
+        TODO add docstring
+        """
+        if reset_io:
+            # reset outputs to defaults if present, otherwise to 0
+            for k, v in self.serial_out.items():
+                if 'default' in v:
+                    v['value'] = v['default']
+                else:
+                    v['value'] = 0
+            # only reset clock here, others depend on the task and will be reset in the machine reset
+            self.serial_in['t_ms']['value'] = 0
+            
+        
+        if clear_log:
+            for k in ['events', 'trials', 'states', 'blocks']:
+                self.log[k].clear()
+            self.log['controls'].clear()
+            
+        self.machine.stop_state_machine()
+        # TODO: self.machine.reset()
+        self.machine.start_state_machine()                
+    
+    def step(self, action: dict, n_ticks: int=1):
+        """
+        TODO add docstring
+        """
+        # apply action by writing into serial_in values that are normally provided by Dummy_Networker
+        for k, val in action.items():
+            if k in self.serial_in:
+                self.serial_in[k]['value'] = val
+                
+        from core import main_loops
+        for _ in range(n_ticks):
+            main_loops.main.draw()
+            
+        obs = self.get_obs()
+        info = {
+            "t_ms": self.serial_in['t_ms']['value'],
+            "quit": self.run_controls.quitting,
+        }
+        return obs, info
