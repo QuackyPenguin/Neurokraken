@@ -4,9 +4,10 @@ import pathlib, json, pickle
 main, visual = None, None
 
 class Main(Sketch):
-    def __init__(self, networker, serial_in, serial_out, run_controls, log:dict, log_dir:str, state_machine, 
+    def __init__(self, networker, serial_in, serial_out, run_controls, log:dict, log_dir:str, state_machine,
                  max_framerate=8_000, permanent_states:list[Callable]=[], threads_info:dict={}, log_performance=False,
-                 run_at_start:Callable=lambda:None, run_at_quit:Callable=lambda:None, run_post_trial:Callable=lambda:None):
+                 run_at_start:Callable=lambda:None, run_at_quit:Callable=lambda:None, run_post_trial:Callable=lambda:None,
+                 mode:str='teensy', sim_speed:float=1.0, task_tick_hz:int=200, render_hz:int=0, action_hold_steps:int=1):
         super().__init__()
         self.netw = networker
         self.serial_in, self.serial_out = serial_in, serial_out
@@ -21,24 +22,33 @@ class Main(Sketch):
         self.run_at_start = run_at_start
         self.run_at_quit = run_at_quit
         self.log_performance = log_performance
+        self.mode = mode
+        self.sim_speed = sim_speed
+        self.task_tick_hz = task_tick_hz
+        self.render_hz = render_hz
+        self.action_hold_steps = action_hold_steps
 
         self.running = True # pulse for standalone no-sketch use
 
-    def settings(self):
-        self.size(10,10)
-
-    def setup(self):            
-        self.window_title('Neurokraken Main Thread')
-        self.get_surface().set_visible(False)
-        self.frame_rate(self.max_framerate)
+    def _init_state(self):
+        """Initialize runtime state that is normally set up in setup().
+        Called directly in headless/agent mode where the py5 sketch never starts."""
         if self.log_performance:
             self.log_dict['t_main_loop'] = []
             self.log_dict['t_received'] = []
         self.serialout_key_lastval_updated = [[k, v['value'], False] for k, v in self.serial_out.items() if not k == 'start_stop']
         for out in self.serialout_key_lastval_updated:
             self.log_dict['controls'][out[0]] = [ [0, out[1]] ]
-        # initialize communication
         self.netw.write_teensy_data(self.serial_out)
+
+    def settings(self):
+        self.size(10,10)
+
+    def setup(self):
+        self.window_title('Neurokraken Main Thread')
+        self.get_surface().set_visible(False)
+        self.frame_rate(self.max_framerate)
+        self._init_state()
 
     def draw(self):
         if self.await_update():

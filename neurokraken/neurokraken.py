@@ -58,9 +58,14 @@ class Neurokraken:
             task_path (Path, optional): Useful in runner mode, this folder (i.e. tasks/my_task) will be copied to the 
                                         log folder as a backup of the experiment run. This path will also be searched
                                         for a file launch.py to import and run before the experiment start.
-            import_pre_run (str, optional): Useful in runner mode. 
+            import_pre_run (str, optional): Useful in runner mode.
                                             Path to a .py file to import just before starting the run, i.e. to start a GUI.
-            TODO: write the description for the new parameters headless, sim_speed, task_tick_hz, render_hz, action_hold_steps
+            headless (bool, optional): Disable all visual output and cameras/microphones. When True, run() returns
+                                       immediately after setup so the caller can drive the loop via step(). Defaults to False.
+            sim_speed (float, optional): Simulation speed multiplier (passed to Main, implementation pending). Defaults to 1.0.
+            task_tick_hz (int, optional): Target tick rate for the task state machine (passed to Main, implementation pending). Defaults to 200.
+            render_hz (int, optional): Target render rate; 0 means no rendering (passed to Main, implementation pending). Defaults to 0.
+            action_hold_steps (int, optional): Number of ticks to hold each action in step() by default (passed to Main). Defaults to 1.
         """
         self.running_config2teensy = False
         stack = inspect.stack()
@@ -292,9 +297,8 @@ class Neurokraken:
                                           max_framerate=self.max_framerate, permanent_states=permanent_states,
                                           threads_info=self.threads_info, 
                                           run_at_start=run_at_start, run_at_quit=run_at_quit, run_post_trial=run_post_trial,
-                                          log_performance=self.log_performance, 
-                                          # new:
-                                          mode=self.mode, sim_speed = self.sim_speed, task_tick_hz=self.task_tick_hz, 
+                                          log_performance=self.log_performance,
+                                          mode=self.mode, sim_speed=self.sim_speed, task_tick_hz=self.task_tick_hz,
                                           render_hz=self.render_hz, action_hold_steps=self.action_hold_steps,
         )
         
@@ -305,12 +309,11 @@ class Neurokraken:
                                                   run_controls=self.run_controls, threads_info=self.threads_info,
                                                   run_at_visual_start=run_at_visual_start)
         #------------------------- LOAD ASSETS -------------------------
-        
-        if self.display_config is not None and not self.headless:
+
+        if not self.headless:
             from py5 import Sketch as _Sketch
-            Sketch = _Sketch
-            class Pre_Task(Sketch):
-                """This sketch merely acts as a py5 instance to run py5 depending code, i.e. loading textures 
+            class Pre_Task(_Sketch):
+                """This sketch merely acts as a py5 instance to run py5 depending code, i.e. loading textures
                 before the main- and display loops that may depend on this data being loaded."""
                 def __init__(self, blocks):
                     super().__init__()
@@ -331,19 +334,17 @@ class Neurokraken:
                     # - once the sketch ran for several frames assets should be loaded.
                     if self.frame_count == 5:
                         self.exit_sketch()
-            
+
             pre_task = Pre_Task(self.machine.blocks)
             pre_task.run_sketch(block=True)
-        
+
         else:
-            # Headless: optionally call pre_task(None) without py5
+            # headless: call pre_task(None) as a lightweight hook; states that need a real sketch should guard against it
             for block in self.machine.blocks.values():
                 for state in block.values():
-                    # only call if state overrides pre_task and can handle None
                     try:
                         state.pre_task(None)
                     except Exception:
-                        # state.pre_task expects a Sketch; in headless we skip assets
                         pass
 
         #------------------------- GARBAGE COLLECTION -------------------------
@@ -418,6 +419,11 @@ class Neurokraken:
 
         #------------------------- MAIN LOOP -------------------------
 
+        if self.headless:
+            # headless/agent mode: initialize without starting a sketch; caller drives the loop via step()
+            main_loops.main._init_state()
+            return
+
         if self.main_as_sketch:
             # more priority/consistency amidst parallel processes like camera capturing
             main_loops.main.run_sketch(block=True)
@@ -427,12 +433,16 @@ class Neurokraken:
             while main_loops.main.running:
                 main_loops.main.draw()
 
-        if self.log_dir is None:
+        self.close()
+
+    def close(self):
+        """Release temporary resources. Call this after the training loop ends when using headless mode."""
+        if hasattr(self, 'tempdir'):
             while True:
-                try: 
+                try:
                     self.tempdir.cleanup()
                     break
-                except PermissionError as e:
+                except PermissionError:
                     # some process (likely video saving) is still utilizing the temp dir preventing deletion - try again later
                     time.sleep(0.1)
                     
@@ -464,8 +474,11 @@ class Neurokraken:
         return reward_dict
 
     def reset(self, clear_log: bool = True, reset_io: bool = True):
-        """
-        TODO add docstring
+        """Reset the experiment for the next RL episode.
+
+        Args:
+            clear_log (bool): Clear events, trials, states, blocks, and controls from the log. Defaults to True.
+            reset_io (bool): Reset serial_out values to their defaults and t_ms to 0. Defaults to True.
         """
         if reset_io:
             # reset outputs to defaults if present, otherwise to 0
@@ -488,8 +501,16 @@ class Neurokraken:
         self.machine.start_state_machine()                
     
     def step(self, action: dict, n_ticks: int=1):
-        """
-        TODO add docstring
+        """Advance the task by n_ticks and return the resulting observation.
+
+        Must only be called after load_task() and run() (which returns immediately in headless mode).
+
+        Args:
+            action (dict): Keys matching serial_in entries to inject as the agent's action this tick.
+            n_ticks (int): Number of main-loop ticks to advance. Defaults to 1.
+
+        Returns:
+            tuple: (obs dict from get_obs(), info dict with t_ms and quit flag)
         """
         # apply action by writing into serial_in values that are normally provided by Dummy_Networker
         for k, val in action.items():
