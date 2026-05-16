@@ -182,6 +182,8 @@ class State_Machine():
         if start_block is None:
             # the start_block is the first block key
             start_block = [*self.blocks][0]
+        # remembered so reset() can return the machine to the same starting block for a new RL episode
+        self._start_block = start_block
         self.switch_block(start_block)
 
     #------------------------- PROGRESS BLOCK/TRIAL/STATE -------------------------
@@ -247,4 +249,19 @@ class State_Machine():
     def quit(self):
         "stop the state machine, save the log and exit the program"
         self.run_controls.quitting = True
+
+    def reset(self):
+        """Reset the state machine to its starting block/state for a new RL episode.
+
+        Clears the was_stopped guard so the machine can be re-started after stop_state_machine(),
+        zeros the trial counter, and re-enters the originally configured start_block via
+        switch_block (which fires the new starting state's on_start / run_at_start hooks).
+        """
+        self.was_stopped = False
+        self.run_controls.active = False
+        self.run_controls.beginning = False
+        self.current_block_trials = 0
+        # forces switch_block to take its "first time this program runs" branch and seat current_state
+        self.current_state = None
+        self.switch_block(self._start_block)
 

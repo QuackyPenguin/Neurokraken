@@ -249,9 +249,24 @@ class Networker(object):
         self.ser.close()
 
 class Dummy_Networker():
-    """A simple Dummy networker that instead of communicating with a teensy allows using local inputs like the keyboard or an agent"""
+    """A simple Dummy networker that instead of communicating with a teensy allows using local inputs like the keyboard or an agent.
 
-    def __init__(self, mode='keyboard', agent=None, *args, **kwargs):
+    Time source depends on virtual_time_step_ms: when None, t_ms is read from the wall clock on each
+    read_teensy_data() call (used by keyboard mode and visual agent mode). When set, t_ms is advanced
+    deterministically by that delta per call instead (used by headless agent mode); the agent.act()
+    callback is also skipped in this branch because the headless caller injects actions via Neurokraken.step()."""
+
+    def __init__(self, mode='keyboard', agent=None, virtual_time_step_ms=None, *args, **kwargs):
+        """
+        Args:
+            mode (str, optional): 'keyboard' to poll keys for serial_in values, or 'agent' to call agent.act()
+                                  on each read_teensy_data (visual agent mode). Defaults to 'keyboard'.
+            agent (object, optional): Object with an act() method and act_freq (Hz) attribute. Required for
+                                      visual agent mode; ignored when virtual_time_step_ms is set (headless).
+            virtual_time_step_ms (float, optional): When set, switches to deterministic virtual time: each
+                                                    read_teensy_data() advances t_ms by this many ms and the
+                                                    agent.act() callback is skipped. Defaults to None (wall-clock).
+        """
         print('running dummy networker for keyboard inputs - no connected teensy needed.\n' +
               'Press ctrl+alt+k to toggle the key input recognition active/inactive')
         self.controlled_serial_in:list[str] = []
@@ -260,11 +275,24 @@ class Dummy_Networker():
         self.mode=mode
         self.agent = agent
         self.t_last_agent_act = 0
+        # When set, time advances deterministically by this delta per read_teensy_data() call
+        # instead of from the wall clock. Used by headless RL training so a tick is one tick
+        # regardless of how long Python actually took.
+        self.virtual_time_step_ms = virtual_time_step_ms
 
     def initialize_communication(self, num_bytes_out=3):
         pass
 
     def read_teensy_data(self, serial_in):
+        if self.virtual_time_step_ms is not None:
+            # headless / virtual time mode: advance the simulated clock by a fixed step
+            # and skip wall-clock + agent.act() (actions are injected via Neurokraken.step())
+            if 't_ms' in serial_in:
+                serial_in['t_ms']['value'] += self.virtual_time_step_ms
+            if 't_us' in serial_in:
+                serial_in['t_us']['value'] += self.virtual_time_step_ms * 1000.0
+            return True, None
+
         # time
         if self.start_time is None:
             self.start_time = time.time_ns() / 1_000_000.

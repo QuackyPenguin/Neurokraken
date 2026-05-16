@@ -42,8 +42,16 @@ class Neurokraken:
             serial_out (dict): Dictionary containing serial output configuration
             log_dir (str|None, optional): Directory path for logging output. A log folder will be created at this location.
                                           Defaults to the current folder './'. None to not save a log.
-            mode (str, optional): Operating mode ('teensy', 'keyboard' or 'agent') Defaults to 'teensy'
-            agent (class, optional): A class with a def act() method to run when mode='agent'
+            mode (str, optional): Operating mode ('teensy', 'keyboard' or 'agent'). Defaults to 'teensy'.
+                                  In 'agent' mode there are two sub-flows depending on headless:
+                                  with headless=False (visual) the main loop runs as a blocking py5 sketch and the
+                                  agent object's act() method is called periodically from inside Dummy_Networker,
+                                  writing actions into serial_in from within act().
+                                  With headless=True (RL training) run() returns immediately and you drive the loop
+                                  yourself via nk.step(action_dict); the agent argument is ignored.
+            agent (class, optional): A class with a def act(self) method and an act_freq (Hz) attribute,
+                                     called periodically from inside the main loop when mode='agent' and headless=False.
+                                     Ignored in headless mode where actions are injected via nk.step() instead.
             display (dict, optional): A configurators.Display() to position the subject's task view among
                                              the computer's connected displays.
             cameras (list, optional): List of camera configurations using configurators.Camera()
@@ -60,12 +68,16 @@ class Neurokraken:
                                         for a file launch.py to import and run before the experiment start.
             import_pre_run (str, optional): Useful in runner mode.
                                             Path to a .py file to import just before starting the run, i.e. to start a GUI.
-            headless (bool, optional): Disable all visual output and cameras/microphones. When True, run() returns
-                                       immediately after setup so the caller can drive the loop via step(). Defaults to False.
+            headless (bool, optional): Disable all visual output and cameras/microphones, and switch the Dummy_Networker
+                                       to a deterministic virtual clock (1000/task_tick_hz ms per tick) instead of wall-clock.
+                                       When True, run() returns immediately after setup so the caller can drive the loop
+                                       via nk.step() and nk.reset() (the standard RL training entry points). Defaults to False.
             sim_speed (float, optional): Simulation speed multiplier (passed to Main, implementation pending). Defaults to 1.0.
-            task_tick_hz (int, optional): Target tick rate for the task state machine (passed to Main, implementation pending). Defaults to 200.
+            task_tick_hz (int, optional): Target tick rate for the task state machine. In headless mode this also sets
+                                          the virtual clock step (1000/task_tick_hz ms per Main.draw()). Defaults to 200.
             render_hz (int, optional): Target render rate; 0 means no rendering (passed to Main, implementation pending). Defaults to 0.
-            action_hold_steps (int, optional): Number of ticks to hold each action in step() by default (passed to Main). Defaults to 1.
+            action_hold_steps (int, optional): Default number of state-machine ticks each headless nk.step() advances when
+                                               n_ticks is not given. Unused in visual mode (the loop ticks freely). Defaults to 1.
         """
         self.running_config2teensy = False
         stack = inspect.stack()
@@ -195,7 +207,9 @@ class Neurokraken:
         if mode=='keyboard':
             self.networker = netw.Dummy_Networker()
         elif mode =='agent':
-            self.networker = netw.Dummy_Networker(mode='agent', agent=agent)
+            # Headless RL training drives a virtual clock instead of wall-clock so a tick is deterministic.
+            virtual_time_step_ms = (1000.0 / self.task_tick_hz) if self.headless else None
+            self.networker = netw.Dummy_Networker(mode='agent', agent=agent, virtual_time_step_ms=virtual_time_step_ms)
         else:
             try:
                 self.networker = netw.Networker(serial_key=serial_key,
@@ -393,6 +407,12 @@ class Neurokraken:
             keyboard.on_release(keyboard_startstop)
 
     def run(self):
+        """Start the experiment.
+
+        In visual mode (the default) this blocks on the py5 main sketch loop until the experiment quits
+        (Ctrl+Alt+Q or get.quit()). In headless mode it initializes the main loop and returns immediately
+        so the caller can drive the state machine via nk.step() and nk.reset().
+        """
         if self.running_config2teensy:
             return
 
@@ -449,32 +469,61 @@ class Neurokraken:
                     
     # NEW: agent mode methods
     def get_obs(self, keys: list[str] | None = None) -> dict:
-        """Observation for agents/RL. Gets the current serial_in values and task context."""
-        from . import controls
+        """Observation for agents/RL. Returns the current serial_in values plus task context.
+
+        Primarily used by the headless RL loop where the caller pulls an observation after each nk.step(),
+        but also works in visual mode (e.g. inside Agent.act() if you want a single dict view of the inputs).
+
+        Args:
+            keys (list[str], optional): Subset of serial_in keys to include in the vector. Defaults to every
+                                        serial_in entry except 't_ms'.
+
+        Returns:
+            dict with keys 'vector' (list of current values), 'keys' (matching key order),
+            '_state' (current state name str), '_block' (current block name str), '_t_ms' (current sim time).
+        """
         if keys is None:
             keys = [k for k in self.serial_in.keys() if k != 't_ms']
         obs_vec = [self.serial_in[k].get('value') for k in keys]
+        current_state = self.machine.current_state
         return {
             'vector': obs_vec,
             'keys': keys,
-            '_state': getattr(controls.get, 'current_state', None),
-            '_block': getattr(controls.get, 'current_block', None),
+            '_state': current_state.name if current_state is not None else None,
+            '_block': self.machine.current_block,
             '_t_ms': self.serial_in['t_ms']['value'],
         }
-    
+
     def get_reward_dict(self, include_input: bool = False) -> dict:
-        """Get a dictionary of output values that would be considered a reward by the current task. Optionally include input values as well. This can be used as an interface to define a reward function for RL agents based on the task itself."""
-        from . import controls
+        """Get a dictionary of output values that would be considered a reward by the current task.
+        Optionally include input values as well. This can be used as an interface to define a reward function
+        for RL agents based on the task itself.
+
+        Caveat: devices with reset_after_send=True (timed_on, tone, ...) have their value zeroed inside
+        write_teensy_data during the same tick they fire. To detect such reward events reliably, diff the
+        per-output change history in get.log['controls'][key] instead of relying on this dict's live value.
+
+        Args:
+            include_input (bool, optional): Also include current serial_in values. Defaults to False.
+
+        Returns:
+            dict of {serial_out key: current value} plus '_state' (current state name) and '_block' (current block name).
+        """
         reward_dict = {k: v.get('value') for k, v in self.serial_out.items()}
         if include_input:
             reward_dict.update({k: v.get('value') for k, v in self.serial_in.items()})
         # add task context
-        reward_dict['_state'] = getattr(controls.get, 'current_state', None)
-        reward_dict['_block'] = getattr(controls.get, 'current_block', None)
+        current_state = self.machine.current_state
+        reward_dict['_state'] = current_state.name if current_state is not None else None
+        reward_dict['_block'] = self.machine.current_block
         return reward_dict
 
     def reset(self, clear_log: bool = True, reset_io: bool = True):
         """Reset the experiment for the next RL episode.
+
+        Intended for headless mode where you drive episodes from a Python loop. In visual mode the main loop
+        runs continuously and the state machine just keeps looping through blocks/states; there's no concept
+        of an "episode" to reset between, so calling this from a visual run is rarely useful.
 
         Args:
             clear_log (bool): Clear events, trials, states, blocks, and controls from the log. Defaults to True.
@@ -495,28 +544,39 @@ class Neurokraken:
             for k in ['events', 'trials', 'states', 'blocks']:
                 self.log[k].clear()
             self.log['controls'].clear()
-            
+            # Main.draw() expects log['controls'][key] to exist for every serial_out entry.
+            # _init_state repopulates it (and also rebuilds Main's internal serialout_key_lastval_updated
+            # mirror so it reflects the post-reset default values).
+            from core import main_loops
+            main_loops.main._init_state()
+
         self.machine.stop_state_machine()
-        # TODO: self.machine.reset()
-        self.machine.start_state_machine()                
+        self.machine.reset()
+        self.machine.start_state_machine()
     
-    def step(self, action: dict, n_ticks: int=1):
+    def step(self, action: dict, n_ticks: int | None = None):
         """Advance the task by n_ticks and return the resulting observation.
 
-        Must only be called after load_task() and run() (which returns immediately in headless mode).
+        Headless mode only - in visual mode the main loop is a blocking py5 sketch driven by run(), and the
+        agent injects actions via its Agent.act() callback instead of calling step() directly. Must be called
+        only after load_task() and run() (which returns immediately in headless mode).
 
         Args:
             action (dict): Keys matching serial_in entries to inject as the agent's action this tick.
-            n_ticks (int): Number of main-loop ticks to advance. Defaults to 1.
+                           The value persists across all n_ticks ticks (Dummy_Networker's virtual-clock branch
+                           does not overwrite serial_in values between ticks).
+            n_ticks (int, optional): Number of main-loop ticks to advance. Defaults to self.action_hold_steps.
 
         Returns:
             tuple: (obs dict from get_obs(), info dict with t_ms and quit flag)
         """
+        if n_ticks is None:
+            n_ticks = self.action_hold_steps
         # apply action by writing into serial_in values that are normally provided by Dummy_Networker
         for k, val in action.items():
             if k in self.serial_in:
                 self.serial_in[k]['value'] = val
-                
+
         from core import main_loops
         for _ in range(n_ticks):
             main_loops.main.draw()
