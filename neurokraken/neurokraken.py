@@ -19,6 +19,26 @@ class _SerialReady(Exception):
     """Raised when serial dictionaries are ready for config2teensy"""
     pass
 
+class _MockSketch:
+    """Absorbs all sketch method calls in headless pre_task so states fully initialize without a display.
+    Returns itself from attribute access and calls so chains like sketch.load_image(p).get_np_pixels()*scale
+    don't raise AttributeError. __array__ lets numpy consume the mock (np.flip etc.) without crashing."""
+    def __getattr__(self, name):
+        return self
+    def __call__(self, *args, **kwargs):
+        return _MockSketch()
+    def get_np_pixels(self):
+        import numpy as _np
+        return _np.zeros((1, 1, 4), dtype=_np.uint8)
+    def __mul__(self, other): return _MockSketch()
+    def __rmul__(self, other): return _MockSketch()
+    def __add__(self, other): return _MockSketch()
+    def __radd__(self, other): return _MockSketch()
+    def __sub__(self, other): return _MockSketch()
+    def __rsub__(self, other): return _MockSketch()
+    def __truediv__(self, other): return _MockSketch()
+    def __rtruediv__(self, other): return _MockSketch()
+
 class Neurokraken:
     def __init__(self, serial_in:dict={}, serial_out:dict={}, log_dir:str|None='./', mode='teensy',
                  display:dict=None, cameras:list=(), microphones:list=(),
@@ -143,7 +163,7 @@ class Neurokraken:
             self.log_dir = Path(self.tempdir.name)
 
         if not self.log_dir.exists():
-            os.mkdir(self.log_dir)
+            os.makedirs(self.log_dir)
 
         if task_path is not None:
             # save a backup of the current version of the task
@@ -163,7 +183,9 @@ class Neurokraken:
 
         #------------------------- LOG -------------------------
 
-        self.log = {'experiment_data': {'datetime': str(datetime.now()),
+        from collections import defaultdict
+        self.log = defaultdict(list, {
+                    'experiment_data': {'datetime': str(datetime.now()),
                                         **subject # content of subject dict or subject.json
                                         },
                     'events': [], # (time,str) entries
@@ -173,8 +195,7 @@ class Neurokraken:
                     'cameras (t_ms/#frame/vid_time)': {},
                     'microphones (t_ms/audio_time)': {},
                     'controls': {}, # serial_out changes
-                    # serial_in readings
-                    }
+                    })
 
         #------------------------- RUN CONTROLS -------------------------
         from dataclasses import dataclass
@@ -353,13 +374,12 @@ class Neurokraken:
             pre_task.run_sketch(block=True)
 
         else:
-            # headless: call pre_task(None) as a lightweight hook; states that need a real sketch should guard against it
+            # headless: use a mock sketch so states can call sketch methods without a display
+            mock = _MockSketch()
+            print('Running in headless mode: using a mock sketch to load assets without a display. If you see AttributeErrors related to the sketch, consider adding the relevant method to the _MockSketch class.', flush=True)
             for block in self.machine.blocks.values():
                 for state in block.values():
-                    try:
-                        state.pre_task(None)
-                    except Exception:
-                        pass
+                    state.pre_task(mock)
 
         #------------------------- GARBAGE COLLECTION -------------------------
 
