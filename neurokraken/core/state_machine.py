@@ -260,6 +260,7 @@ class State_Machine():
         self.was_stopped = False
         self.run_controls.active = False
         self.run_controls.beginning = False
+        self.run_controls.quitting = False  # clear quit flag so headless episodes can run past episode 1
         self.current_block_trials = 0
         # forces switch_block to take its "first time this program runs" branch and seat current_state
         self.current_state = None

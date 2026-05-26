@@ -561,9 +561,18 @@ class Neurokraken:
             
         
         if clear_log:
+            # Clear framework keys
             for k in ['events', 'trials', 'states', 'blocks']:
                 self.log[k].clear()
             self.log['controls'].clear()
+            # Also clear any task-specific list keys added by task.py (e.g. collected, spawns,
+            # rewards_t[ms]/x/y, etc.) so per-episode counts don't accumulate across resets.
+            # We skip non-list/non-dict keys and the experiment_data identity dict.
+            _skip = {'experiment_data', 'events', 'trials', 'states', 'blocks', 'controls',
+                     'cameras (t_ms/#frame/vid_time)', 'microphones (t_ms/audio_time)'}
+            for k, v in list(self.log.items()):
+                if k not in _skip and isinstance(v, list):
+                    v.clear()
             # Main.draw() expects log['controls'][key] to exist for every serial_out entry.
             # _init_state repopulates it (and also rebuilds Main's internal serialout_key_lastval_updated
             # mirror so it reflects the post-reset default values).
@@ -571,9 +580,18 @@ class Neurokraken:
             main_loops.main._init_state()
 
         self.machine.stop_state_machine()
+        # In headless mode, re-run pre_task for all states so they rebuild any world/effect
+        # objects that were created during setup (e.g. task.Game.self.worlds).  pre_task is
+        # designed as a one-shot setup run by load_task; without this, episode 2+ reuses the
+        # depleted world from episode 1 and nothing gets spawned or collected.
+        if self.headless:
+            mock = _MockSketch()
+            for block in self.machine.blocks.values():
+                for state in block.values():
+                    state.pre_task(mock)
         self.machine.reset()
         self.machine.start_state_machine()
-    
+
     def step(self, action: dict, n_ticks: int | None = None):
         """Advance the task by n_ticks and return the resulting observation.
 
